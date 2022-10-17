@@ -1,7 +1,17 @@
+/**
+ * Name: Yashwardhann Kumar (u3566269@connect.hku.hk)
+ * Student No: 3035662699
+ * Development Platform: MacOS
+ * Remark: Implemented all features including bonus
+ * @copyright Copyright (c) 2022
+ *
+ */
+
 #include <stdio.h>  /* standard io */ 
 #include <stdlib.h> /* std lib */ 
 #include <stdbool.h>    /* bool datatype */ 
 #include <string.h> /* string ops */ 
+#include <sys/queue.h> /* queue */ 
 #include <unistd.h> /* for proc func */
 #include <errno.h>  /* errno */ 
 #include <sys/wait.h>   /* wait, waitpid */ 
@@ -21,13 +31,20 @@
 struct Arguments {
     size_t  argc;       /* number of args */
     char    *argv[_ARGVSZ]; /* args vector */ 
+    bool    logstat; /* flag for stat logging */ 
+    bool    pipe_enable; /* flag to check for piping */
 };
 
 typedef struct Arguments Arguments;
 
 /* Global variables */ 
-bool EXIT = 0;
-const char *term_name = "3230shell";
+bool            EXIT = 0;
+const char*     term_name = "3230shell";
+char            rdbuf[_BUFSZ];
+pid_t           cur_child_proc = 0; 
+
+
+void main_loop(void);
 
 /* Register Signal handlers 
  * for the parent process. 
@@ -35,12 +52,26 @@ const char *term_name = "3230shell";
  * Supported signals: 
  *  1) SIGINT
  *  2) SIGCHLD
- *  3) SIGEXIT 
+ *  3) SIGUSR1
  */
 void _SIGINT_HANDLER(int arg) {
     char* msg = "Interrupt!\n\0";
     write( STDOUT_FILENO, msg, strlen(msg)+1 );
     fflush(stdout);
+    
+    if ( cur_child_proc != 0 ) {
+        kill( cur_child_proc, SIGINT );
+        fflush(stdout);
+    }
+
+    main_loop();
+}
+
+void _SIGUSER1_HANDLER( int sig ) {
+    if ( cur_child_proc != 0 ) {
+        // send signal to current child 
+        kill( cur_child_proc, SIGUSR1 );
+    }
 }
 
 void _SIGCHD_HANDLER() {
@@ -66,6 +97,17 @@ void print_tasks(Arguments** tasks) {
     }
 }
 
+// Moves string by k positions
+void strmv( char* str, size_t mv_amt ) {
+    size_t i = 0;
+    while ( i < _ARGSZ && str[i] != '\0' ) {
+        str[i] = str[i + mv_amt];
+        ++i;
+    }
+
+    str[i] = '\0';
+}
+
 /* Count number of processes in given task */ 
 size_t cproc(Arguments** tasks) {
     if ( tasks == NULL ) return 0;
@@ -81,10 +123,11 @@ size_t cproc(Arguments** tasks) {
 
 /* Executes multiple tasks connected via pipes */
 void __exec_multi( Arguments** t ) {
-    size_t          nproc=cproc(t); /* number of proc */ 
+    size_t          nproc = cproc(t); /* number of proc */ 
     pid_t           pid[nproc]; /* pid of child proc */ 
+    int             status[nproc];
     int             pipefd[nproc][2];   /* stores pipe fd for each proc */
-    bool            logstat; 
+    bool            logstat = 0; 
     struct rusage   usagestat[nproc]; /* usage stat for child proc */ 
 
     // create pipe for each child proc 
@@ -93,23 +136,29 @@ void __exec_multi( Arguments** t ) {
             perror( "pipe failed" );
         }
     }
-
     // check for timeX command 
-    printf("%s\n", *t[0]->argv);
+    if ( t[0]->logstat == true ) {
+        if ( t[0]->argc == 0 ) {
+            fprintf(stderr, "3230shell: %s \n", "\"timeX\" cannot be a standalone command");
+            return;
+        } 
+        logstat = true;
+    }
 
     // iterate over processes and execute sequentially
     for ( int i = 0; i < nproc; ++i ) {
         pid[i] = fork(); // fork new child process 
 
+        if (i == 0) {
+            cur_child_proc = pid[i];
+        }
         if ( pid[i] < 0 ) {
             // handle fork failure
             perror("fork failed");
             exit(1);
         }
-
         if ( pid[i] == 0 ) {
-            // printf("Child %d (pid = %d)\n", i, getpid());
-            
+            // printf("Child %d (pid = %d)\n", i, getpid());   
             if ( i == 0 ) {
                 // dup stdout to current pipe write 
                 dup2(pipefd[i][PIPE_WR], STDOUT_FILENO);
@@ -124,18 +173,31 @@ void __exec_multi( Arguments** t ) {
                 // dup stdin to previous pipe read 
                 dup2( pipefd[i-1][PIPE_RD], STDIN_FILENO );
             }
-
             // close read and write pipes 
             for ( int i = 0; i < nproc; ++i ) {
                 close(pipefd[i][PIPE_RD]);
                 close(pipefd[i][PIPE_WR]);
             }
 
-            execvp( *t[i]->argv, t[i]->argv );
+            if ( i == 0 ) {
+                int sig, *sigptr = &sig, ret_val;
+                sigset_t set;
+                sigemptyset(&set);
+                sigaddset(&set, SIGUSR1);
+                sigprocmask( SIG_BLOCK, &set, NULL );
 
+                ret_val = sigwait(&set, sigptr);
+
+                if ( ret_val == -1 ) {
+                    perror( "Sigwait failed!" );
+                    exit(EXIT_FAILURE);
+                } 
+            }
+            execvp( *t[i]->argv, t[i]->argv );
             /* Handle execvp error */ 
             fprintf( stderr, "3230shell: '%s': %s \n", *t[i]->argv, strerror(errno) );
             exit(EXIT_FAILURE);
+            
         } 
     }   
 
@@ -147,8 +209,19 @@ void __exec_multi( Arguments** t ) {
 
     // Wait for child processes to finish executing 
     for (int i = 0; i < nproc; ++i) {
-        waitpid(pid[i], NULL, 0);
+        wait4(pid[i], &status[i], WUNTRACED, &usagestat[i]);
     } 
+
+    cur_child_proc = 0;
+
+    if (logstat) {
+        for ( int i = 0; i < nproc; ++i ) {
+            printf("(PID)%d  (CMD)%s    ", pid[i], *t[i]->argv);
+            printf("(user)%ld.%02d s  ", usagestat[i].ru_utime.tv_sec, usagestat[i].ru_utime.tv_usec);
+            printf("(sys) %ld.%02d s\n", usagestat[i].ru_stime.tv_sec, usagestat[i].ru_stime.tv_usec);
+        }
+    }
+    
 }
 
 
@@ -157,12 +230,25 @@ void __exec2(char** argv, bool logstat, int read_fd, int write_fd) {
     pid_t           pid, wpid;  /* pid of child proc */ 
     int             status; /* Status of child proc */
     struct rusage   usagestat;  /* Usage statistics */
+   
 
-    pid = fork();
-    
+    // printf("Command: %s\n", *argv);
+    // printf("Arguments: ");
+    // for ( int i = 0; i < _ARGVSZ; ++i ) {
+    //     if ( argv[i] == NULL ) break;
+    //     printf("%s ", argv[i]);
+    // }
+    // printf("\n");
+
+
+    pid = fork();    
     int pipefd[2] = { read_fd, write_fd };
 
+    cur_child_proc = pid;
+
     if (pid == 0) {
+        int sig, *sigptr = &sig, ret_val;
+        
         // Child process
         dup2(STDOUT_FILENO, pipefd[PIPE_WR]);
         //dup2(pipefd[0], STDIN_FILENO);
@@ -172,7 +258,20 @@ void __exec2(char** argv, bool logstat, int read_fd, int write_fd) {
         // Try to find absolute path 
         //execv(*args.argv, args.argv);
         // If fail exec path 
-        execvp(*argv, argv);
+
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGUSR1);
+        sigprocmask( SIG_BLOCK, &set, NULL );
+
+        ret_val = sigwait(&set, sigptr);
+
+        if ( ret_val == -1 ) {
+            perror( "Sigwait failed!" );
+            exit(EXIT_FAILURE);
+        } else {
+            execvp(*argv, argv);
+        }
 
         fprintf(stderr, "3230shell: '%s': %s \n", *argv, strerror(errno));
         exit(EXIT_FAILURE);
@@ -185,6 +284,9 @@ void __exec2(char** argv, bool logstat, int read_fd, int write_fd) {
             wpid = waitpid(pid, &status, WUNTRACED);
         } while (!WIFEXITED(status) && !WIFSIGNALED(status));
     }
+
+
+    cur_child_proc = 0;
 
     if (logstat) {
         getrusage(RUSAGE_CHILDREN, &usagestat);
@@ -207,36 +309,32 @@ void _terminate() {
 }
 
 void __timex(Arguments args) {
-    if ( args.argc == 1 ) {
+    if ( args.argc == 0 ) {
         fprintf(stderr, "3230shell: %s \n", "\"timeX\" cannot be a standalone command");
         return;
     }
-
-    char* argv[_ARGVSZ];
-    for ( int i = 1; i <= args.argc; ++i ) {
-        argv[i-1] = args.argv[i];
-    }
-
-    // create pipe 
-
-    __exec(argv, true);
+    __exec(args.argv, true);
 
 }
 
 void parse(Arguments args) {
     // printf("Command: %s\n", cmd);
     /* lol please change dis */ 
-    if (strcmp(*args.argv, "exit") == 0) {
-        if ( args.argc > 2 ) {
-            fprintf(stderr, "3230shell: %s \n", "\"exit\" with other arguments!!!");
-        } else {
-            _terminate();
-        }
-    } else if (strcmp(*args.argv, "timeX") == 0) {
+
+    if (args.logstat == true) {
         __timex(args);
     } else {
-        __exec(args.argv, false);
+        if (strcmp(*args.argv, "exit") == 0) {
+            if ( args.argc > 2 ) {
+                fprintf(stderr, "3230shell: %s \n", "\"exit\" with other arguments!!!");
+            } else {
+                _terminate();
+            }
+        } else {
+            __exec(args.argv, false);
+        }
     }
+    
 } 
 
 void flush_str(char* str, size_t sz) {
@@ -248,18 +346,16 @@ void flush_str(char* str, size_t sz) {
 } 
 
 struct Arguments** get_cmd() {
-    int         i, j=0, l=0;
-    size_t      cmdlen = 0, argc=0;
-    char        *argptr;
-    Arguments   **tasks; 
-    char        rdbuf[_BUFSZ];
-    
+    int         i, j=0;
+    bool        prev_pipe = false;
     // Initialise tasks array
-    tasks = (Arguments **) malloc(sizeof(Arguments) * _PIPE_LIMIT);
+    Arguments   **tasks = (Arguments **) malloc(sizeof(Arguments) * _PIPE_LIMIT);
     
     for (int i = 0; i < _PIPE_LIMIT; ++i) {
         tasks[i] = malloc( sizeof( struct Arguments ) );
         tasks[i]->argc = 0;
+        tasks[i]->logstat = false;
+        tasks[i]->pipe_enable = false;
     }
     
     printf("$$ %s ## ", term_name);
@@ -276,9 +372,29 @@ struct Arguments** get_cmd() {
     while (token != NULL) {
         //printf("Token: .%s.\n", token);
         if (strcmp(token, "|") == 0) {
+            if (prev_pipe) {
+                // throw error 
+                fprintf(stderr, "3230shell: %s \n", "should not have two consecutive | without in-between command!");
+                return NULL;
+            }
+            prev_pipe = true;
+            tasks[0]->pipe_enable = true;
             ++j;
         } else {
-            tasks[j]->argv[ tasks[j]->argc++ ] = token;    
+            prev_pipe = false;
+            bool incr_task = false;
+            if (token[strlen(token)-1] == ';') {
+                incr_task = true;
+                token[strlen(token)-1] = '\0';
+            } 
+        
+            if (strcmp(token, "timeX") == 0) {
+                tasks[0]->logstat = true;
+            } else {
+                tasks[j]->argv[ tasks[j]->argc++ ] = token;    
+            }   
+
+            if (incr_task) ++j; 
         }
         token = strtok(NULL, " ");
     }
@@ -286,31 +402,46 @@ struct Arguments** get_cmd() {
     for ( int i = 0; i < j; ++i ) {
         tasks[i]->argv[ tasks[i]->argc ] = NULL;
     }
+    tasks[++j] = NULL;    
 
-    tasks[++j] = NULL;
-  
-    
     return tasks;
 }
 
 void register_signal_handlers() {
-    signal(SIGINT, _SIGINT_HANDLER);
-    signal(SIGCHLD, _SIGCHD_HANDLER);
+    signal(SIGINT, &_SIGINT_HANDLER);
+    signal(SIGCHLD, &_SIGCHD_HANDLER);
+    signal(SIGUSR1, &_SIGUSER1_HANDLER);
 }   
+
+void main_loop() {
+    while (!EXIT) {
+        struct Arguments** tasks = get_cmd();
+
+        if (tasks == NULL) {
+            continue;
+        }
+        
+        size_t sz_ = cproc(tasks);
+
+        if ( sz_ == 1 ) parse(*tasks[0]);
+        else {
+            if ( tasks[0]->pipe_enable ) {
+                __exec_multi(tasks);
+            } else {
+                for ( int i = 0; i < sz_; ++i ) {
+                    parse(*tasks[i]);
+                }
+            }
+        }; 
+    }
+}
 
 /* Initialises the shell */
 void init_shell() { 
     clear();
-
-    register_signal_handlers();
+    printf("---SHELL (PID: %d)---\n", getpid());
     
+    register_signal_handlers();
     // Main loop
-    while (!EXIT) {
-        struct Arguments** tasks = get_cmd();
-        int i = 0; 
-        size_t sz_ = cproc(tasks);
-        if ( sz_ == 1 ) parse(*tasks[0]);
-        else __exec_multi(tasks); 
-    }
-
+    main_loop();
 }
